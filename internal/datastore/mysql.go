@@ -4,15 +4,17 @@
 package datastore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
-	"time"
 
-	"github.com/JamesStewy/go-mysqldump"
 	"github.com/go-sql-driver/mysql"
 
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
@@ -55,64 +57,162 @@ type MySQLConnection struct {
 	db        *sql.DB
 	config    *mysql.Config
 	connector ConnectionEndpoint
+	caPEM     []byte
+	certPEM   []byte
+	keyPEM    []byte
 }
 
+// writeTLSFiles writes any configured CA/client cert/key PEM blobs to dir and
+// returns the mysql-client CLI flags needed to use them (empty if no TLS is set).
+func (c *MySQLConnection) writeTLSFiles(dir string) ([]string, error) {
+	var args []string
+
+	write := func(name string, content []byte) (string, error) {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, content, 0o600); err != nil {
+			return "", fmt.Errorf("unable to write %s: %w", name, err)
+		}
+
+		return p, nil
+	}
+
+	if len(c.caPEM) > 0 {
+		p, err := write("ca.pem", c.caPEM)
+		if err != nil {
+			return nil, err
+		}
+
+		args = append(args, "--ssl-ca="+p)
+	}
+
+	if len(c.certPEM) > 0 && len(c.keyPEM) > 0 {
+		certPath, err := write("client-cert.pem", c.certPEM)
+		if err != nil {
+			return nil, err
+		}
+
+		keyPath, err := write("client-key.pem", c.keyPEM)
+		if err != nil {
+			return nil, err
+		}
+
+		args = append(args, "--ssl-cert="+certPath, "--ssl-key="+keyPath)
+	}
+
+	return args, nil
+}
+
+// Migrate copies the schema's data from c (origin) to target using the official,
+// actively maintained mysqldump/mysql client binaries (dump-to-file, then restore
+// from that file), instead of the previous in-process github.com/JamesStewy/go-mysqldump
+// based implementation. That library (unmaintained since 2018) writes BLOB/TEXT
+// values with zero escaping - a bare value.String wrapped in '...' - so any value
+// containing a backslash immediately followed by a quote silently loses bytes on
+// restore. That pattern is routine in Kubernetes-stored objects (managedFields,
+// annotations holding escaped JSON), and the resulting truncation makes
+// kube-apiserver fail to decode objects on its first full watch-cache resync
+// after migration, while the migrate Job itself reports success. --hex-blob makes
+// BLOB/TEXT values unambiguous 0x<hex> literals, sidestepping escaping entirely.
 func (c *MySQLConnection) Migrate(ctx context.Context, tcp kamajiv1alpha1.TenantControlPlane, target Connection) error {
+	schema := tcp.Status.Storage.Setup.Schema
+
 	// Ensuring the connection is working as expected
 	if err := target.Check(ctx); err != nil {
 		return err
 	}
 	// Creating the target schema if it doesn't exist
-	if ok, _ := target.DBExists(ctx, tcp.Status.Storage.Setup.Schema); !ok {
-		if err := target.CreateDB(ctx, tcp.Status.Storage.Setup.Schema); err != nil {
+	if ok, _ := target.DBExists(ctx, schema); !ok {
+		if err := target.CreateDB(ctx, schema); err != nil {
 			return err
 		}
 	}
-	// Dumping the old datastore in a local file
-	dir, err := os.MkdirTemp("", string(tcp.GetUID()))
-	if err != nil {
-		return fmt.Errorf("unable to create temp directory for MySQL migration: %w", err)
-	}
-	defer os.RemoveAll(dir)
 
-	if _, err = c.db.ExecContext(ctx, fmt.Sprintf("USE %s", quoteMySQLIdentifier(tcp.Status.Storage.Setup.Schema))); err != nil {
-		return fmt.Errorf("unable to switch DB for MySQL migration: %w", err)
-	}
-
-	dumper, err := mysqldump.Register(c.db, dir, fmt.Sprintf("%d", time.Now().Unix()))
-	if err != nil {
-		return fmt.Errorf("unable to create MySQL dumper: %w", err)
-	}
-	defer dumper.Close()
-
-	dumpFile, err := dumper.Dump()
-	if err != nil {
-		return fmt.Errorf("unable to dump from MySQL: %w", err)
-	}
-
-	statements, err := os.ReadFile(dumpFile)
-	if err != nil {
-		return fmt.Errorf("cannot read dump file for MySQL: %w", err)
-	}
-	// Executing the import to the target datastore
 	targetClient := target.(*MySQLConnection) //nolint:forcetypeassert
 
-	// The dump is a batch of semicolon-separated statements, so it must run over
-	// a connection with multiStatements enabled. That connection is scoped to
-	// this import alone and closed right after, keeping the primary connection
-	// single-statement.
-	importDB, err := targetClient.multiStatementConn()
+	tlsDir, err := os.MkdirTemp("", string(tcp.GetUID())+"-tls")
 	if err != nil {
-		return fmt.Errorf("unable to open MySQL multi-statement connection for migration: %w", err)
+		return fmt.Errorf("unable to create temp directory for MySQL migration TLS material: %w", err)
 	}
-	defer importDB.Close()
+	defer os.RemoveAll(tlsDir)
 
-	if _, err = importDB.ExecContext(ctx, fmt.Sprintf("USE %s", quoteMySQLIdentifier(tcp.Status.Storage.Setup.Schema))); err != nil {
-		return fmt.Errorf("unable to switch DB for MySQL migration: %w", err)
+	originTLSDir, targetTLSDir := filepath.Join(tlsDir, "origin"), filepath.Join(tlsDir, "target")
+	if err = os.MkdirAll(originTLSDir, 0o700); err != nil {
+		return fmt.Errorf("unable to create origin TLS directory: %w", err)
+	}
+	if err = os.MkdirAll(targetTLSDir, 0o700); err != nil {
+		return fmt.Errorf("unable to create target TLS directory: %w", err)
 	}
 
-	if _, err = importDB.ExecContext(ctx, string(statements)); err != nil {
-		return fmt.Errorf("cannot execute dump statements for MySQL: %w", err)
+	originTLSArgs, err := c.writeTLSFiles(originTLSDir)
+	if err != nil {
+		return fmt.Errorf("unable to prepare origin TLS material: %w", err)
+	}
+
+	targetTLSArgs, err := targetClient.writeTLSFiles(targetTLSDir)
+	if err != nil {
+		return fmt.Errorf("unable to prepare target TLS material: %w", err)
+	}
+
+	dumpArgs := append([]string{
+		"--host=" + c.connector.Host,
+		"--port=" + strconv.Itoa(c.connector.Port),
+		"--user=" + c.config.User,
+		"--single-transaction",
+		"--hex-blob", // binary-safe: BLOB/TEXT values are emitted as 0x<hex> literals, no string-escaping ambiguity
+		"--skip-add-locks",
+		"--no-tablespaces",
+	}, append(originTLSArgs, schema)...)
+
+	restoreArgs := append([]string{
+		"--host=" + targetClient.connector.Host,
+		"--port=" + strconv.Itoa(targetClient.connector.Port),
+		"--user=" + targetClient.config.User,
+	}, append(targetTLSArgs, schema)...)
+
+	// Dump to an intermediate file rather than streaming mysqldump's stdout
+	// directly into mysql's stdin via an in-process io.Pipe: with a pipe, Go
+	// relays the data through two independently-scheduled copy goroutines
+	// (child -> OS pipe -> goroutine -> io.Pipe -> goroutine -> OS pipe -> child),
+	// which was observed to interleave/misalign rows under real load. Writing to
+	// a file and handing mysql an *os.File for Stdin removes that relay entirely.
+	dumpPath := filepath.Join(tlsDir, "dump.sql")
+
+	dumpFile, err := os.Create(dumpPath)
+	if err != nil {
+		return fmt.Errorf("unable to create MySQL dump file: %w", err)
+	}
+
+	dumpCmd := exec.CommandContext(ctx, "mysqldump", dumpArgs...)
+	dumpCmd.Env = append(os.Environ(), "MYSQL_PWD="+c.config.Passwd)
+	dumpCmd.Stdout = dumpFile
+
+	var dumpStderr, restoreStderr bytes.Buffer
+	dumpCmd.Stderr = &dumpStderr
+
+	dumpErr := dumpCmd.Run()
+	closeErr := dumpFile.Close()
+
+	if dumpErr != nil {
+		return fmt.Errorf("mysqldump failed: %w (stderr: %s)", dumpErr, dumpStderr.String())
+	}
+
+	if closeErr != nil {
+		return fmt.Errorf("unable to finalize MySQL dump file: %w", closeErr)
+	}
+
+	dumpFileForRestore, err := os.Open(dumpPath)
+	if err != nil {
+		return fmt.Errorf("unable to reopen MySQL dump file for restore: %w", err)
+	}
+	defer dumpFileForRestore.Close()
+
+	restoreCmd := exec.CommandContext(ctx, "mysql", restoreArgs...)
+	restoreCmd.Env = append(os.Environ(), "MYSQL_PWD="+targetClient.config.Passwd)
+	restoreCmd.Stdin = dumpFileForRestore
+	restoreCmd.Stderr = &restoreStderr
+
+	if err = restoreCmd.Run(); err != nil {
+		return fmt.Errorf("mysql restore failed: %w (stderr: %s)", err, restoreStderr.String())
 	}
 
 	return nil
@@ -154,31 +254,14 @@ func NewMySQLConnection(config ConnectionConfig) (Connection, error) {
 		return nil, err
 	}
 
-	return &MySQLConnection{db: db, config: mysqlConfig, connector: config.Endpoints[0]}, nil
-}
-
-// multiStatementConn opens a dedicated connection whose DSN carries the
-// multiStatements driver parameter, required to execute a mysqldump batch
-// (many semicolon-separated statements) in a single ExecContext call. It is
-// deliberately kept out of the primary connection so that statements
-// interpolating tenant-controlled identifiers never run over a connection that
-// permits stacked queries. The pool is capped at a single connection so the
-// USE statement and the subsequent import share the same session.
-func (c *MySQLConnection) multiStatementConn() (*sql.DB, error) {
-	cfg := c.config.Clone()
-	if cfg.Params == nil {
-		cfg.Params = map[string]string{}
-	}
-	cfg.Params["multiStatements"] = "true"
-
-	db, err := sql.Open("mysql", cfg.FormatDSN())
-	if err != nil {
-		return nil, err
-	}
-
-	db.SetMaxOpenConns(1)
-
-	return db, nil
+	return &MySQLConnection{
+		db:        db,
+		config:    mysqlConfig,
+		connector: config.Endpoints[0],
+		caPEM:     config.CACertPEM,
+		certPEM:   config.ClientCertPEM,
+		keyPEM:    config.ClientKeyPEM,
+	}, nil
 }
 
 func (c *MySQLConnection) GetConnectionString() string {

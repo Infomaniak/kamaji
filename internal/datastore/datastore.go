@@ -32,16 +32,26 @@ type ConnectionConfig struct {
 	DBName     string
 	TLSConfig  *tls.Config
 	Parameters map[string][]string
+
+	// Raw PEM bytes kept alongside TLSConfig: *tls.Config/*x509.CertPool don't expose
+	// their source PEM back out, but CLI tools used for Migrate() (mysqldump/mysql)
+	// need on-disk PEM files for --ssl-ca/--ssl-cert/--ssl-key.
+	CACertPEM     []byte
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
 }
 
 func NewConnectionConfig(ctx context.Context, client client.Client, ds kamajiv1alpha1.DataStore) (*ConnectionConfig, error) {
 	var tlsConfig *tls.Config
+
+	var caPEM, certPEM, keyPEM []byte
 
 	if ds.Spec.TLSConfig != nil {
 		ca, err := ds.Spec.TLSConfig.CertificateAuthority.Certificate.GetContent(ctx, client)
 		if err != nil {
 			return nil, err
 		}
+		caPEM = ca
 
 		rootCAs := x509.NewCertPool()
 		if ok := rootCAs.AppendCertsFromPEM(ca); !ok {
@@ -59,11 +69,13 @@ func NewConnectionConfig(ctx context.Context, client client.Client, ds kamajiv1a
 		if err != nil {
 			return nil, err
 		}
+		certPEM = crt
 
 		key, err := ds.Spec.TLSConfig.ClientCertificate.PrivateKey.GetContent(ctx, client)
 		if err != nil {
 			return nil, err
 		}
+		keyPEM = key
 
 		certificate, err := tls.X509KeyPair(crt, key)
 		if err != nil {
@@ -108,10 +120,13 @@ func NewConnectionConfig(ctx context.Context, client client.Client, ds kamajiv1a
 	}
 
 	return &ConnectionConfig{
-		User:      user,
-		Password:  password,
-		Endpoints: eps,
-		TLSConfig: tlsConfig,
+		User:          user,
+		Password:      password,
+		Endpoints:     eps,
+		TLSConfig:     tlsConfig,
+		CACertPEM:     caPEM,
+		ClientCertPEM: certPEM,
+		ClientKeyPEM:  keyPEM,
 	}, nil
 }
 
