@@ -26,9 +26,30 @@ builds:
       - arm64
 
 kos:
-  - repositories:
+  - id: kamaji
+    build: kamaji
+    repositories:
       - docker.io/clastix/kamaji
       - quay.io/clastix/kamaji
+    tags:
+      - "{{ .Tag }}"
+    bare: true
+    preserve_import_paths: false
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - linux/arm
+  # Dedicated image for the TenantControlPlane datastore migration Job (--migrate-image).
+  # Built from the same kamaji binary, layered on the official MariaDB image instead of
+  # the distroless default so mysqldump/mysql ship pre-installed and track upstream
+  # MariaDB releases by bumping base_image here, instead of a hand-maintained client
+  # package. The main kamaji image above stays distroless/minimal.
+  - id: kamaji-migrate
+    build: kamaji
+    base_image: docker.io/library/mariadb:11.4
+    repositories:
+      - docker.io/clastix/kamaji-migrate
+      - quay.io/clastix/kamaji-migrate
     tags:
       - "{{ .Tag }}"
     bare: true

@@ -22,6 +22,12 @@ ENVTEST_VERSION ?= release-0.19
 # Image URL to use all building/pushing image targets
 CONTAINER_REPOSITORY ?= docker.io/clastix/kamaji
 
+# Dedicated image used by the TenantControlPlane datastore migration Job (--migrate-image),
+# built from the same kamaji binary but layered on the official MariaDB image instead of
+# the distroless default, so mysqldump/mysql are available for MySQL datastore migrations.
+MIGRATE_CONTAINER_REPOSITORY ?= docker.io/clastix/kamaji-migrate
+MIGRATE_BASE_IMAGE ?= docker.io/library/mariadb:11.4
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -269,6 +275,19 @@ build: $(KO)
 	$(KO) build ./ --bare --tags=$(VERSION) --local=$(KO_LOCAL) --push=$(KO_PUSH) \
 		--image-label "org.opencontainers.image.authors=Clastix https://clastix.io/" \
 		--image-label "org.opencontainers.image.title=Kamaji" \
+		--image-label "org.opencontainers.image.vendor=Clastix" \
+		--image-label "org.opencontainers.image.source=https://github.com/clastix/kamaji" \
+		--image-label "org.opencontainers.image.url=https://kamaji.clastix.io" \
+		--image-label "org.opencontainers.image.created=$$(date --utc '+%FT%H:%M:%SZ')" \
+		--image-label "org.opencontainers.image.revision=$(GIT_HEAD_COMMIT)" \
+		--image-label "org.opencontainers.image.version=$(VERSION)"
+
+build-migrate-image: $(KO) ## Build the kamaji-migrate image: same kamaji binary, layered on MIGRATE_BASE_IMAGE instead of the distroless default, so mysqldump/mysql are available to the --migrate-image Job.
+	LD_FLAGS=$(LD_FLAGS) \
+	KOCACHE=/tmp/ko-cache KO_DOCKER_REPO=${MIGRATE_CONTAINER_REPOSITORY} KO_DEFAULTBASEIMAGE=${MIGRATE_BASE_IMAGE} \
+	$(KO) build ./ --bare --tags=$(VERSION) --local=$(KO_LOCAL) --push=$(KO_PUSH) \
+		--image-label "org.opencontainers.image.authors=Clastix https://clastix.io/" \
+		--image-label "org.opencontainers.image.title=Kamaji Migrate" \
 		--image-label "org.opencontainers.image.vendor=Clastix" \
 		--image-label "org.opencontainers.image.source=https://github.com/clastix/kamaji" \
 		--image-label "org.opencontainers.image.url=https://kamaji.clastix.io" \
