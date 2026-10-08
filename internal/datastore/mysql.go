@@ -102,6 +102,23 @@ func (c *MySQLConnection) writeTLSFiles(dir string) ([]string, error) {
 	return args, nil
 }
 
+// resolveClientBinary looks up primary on PATH, falling back to secondary if it isn't
+// found. Recent official MariaDB images (11.4+) only ship the mariadb/mariadb-dump
+// binaries and no longer install the mysql/mysqldump compatibility symlinks, while a
+// real MySQL image - or an older MariaDB tag - only has the mysql-named ones. Resolving
+// at runtime keeps this working regardless of which image --migrate-image points at.
+func resolveClientBinary(primary, secondary string) (string, error) {
+	if path, err := exec.LookPath(primary); err == nil {
+		return path, nil
+	}
+
+	if path, err := exec.LookPath(secondary); err == nil {
+		return path, nil
+	}
+
+	return "", fmt.Errorf("neither %q nor %q found on PATH", primary, secondary)
+}
+
 // Migrate copies the schema's data from c (origin) to target using the official,
 // actively maintained mysqldump/mysql client binaries (dump-to-file, then restore
 // from that file), instead of the previous in-process github.com/JamesStewy/go-mysqldump
@@ -182,7 +199,12 @@ func (c *MySQLConnection) Migrate(ctx context.Context, tcp kamajiv1alpha1.Tenant
 		return fmt.Errorf("unable to create MySQL dump file: %w", err)
 	}
 
-	dumpCmd := exec.CommandContext(ctx, "mysqldump", dumpArgs...)
+	dumpBin, err := resolveClientBinary("mariadb-dump", "mysqldump")
+	if err != nil {
+		return fmt.Errorf("unable to locate a dump client binary: %w", err)
+	}
+
+	dumpCmd := exec.CommandContext(ctx, dumpBin, dumpArgs...)
 	dumpCmd.Env = append(os.Environ(), "MYSQL_PWD="+c.config.Passwd)
 	dumpCmd.Stdout = dumpFile
 
@@ -206,7 +228,12 @@ func (c *MySQLConnection) Migrate(ctx context.Context, tcp kamajiv1alpha1.Tenant
 	}
 	defer dumpFileForRestore.Close()
 
-	restoreCmd := exec.CommandContext(ctx, "mysql", restoreArgs...)
+	restoreBin, err := resolveClientBinary("mariadb", "mysql")
+	if err != nil {
+		return fmt.Errorf("unable to locate a restore client binary: %w", err)
+	}
+
+	restoreCmd := exec.CommandContext(ctx, restoreBin, restoreArgs...)
 	restoreCmd.Env = append(os.Environ(), "MYSQL_PWD="+targetClient.config.Passwd)
 	restoreCmd.Stdin = dumpFileForRestore
 	restoreCmd.Stderr = &restoreStderr
